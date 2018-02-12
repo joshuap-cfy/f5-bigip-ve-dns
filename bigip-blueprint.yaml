@@ -1,0 +1,806 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.2/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.5.0/plugin.yaml
+  - http://www.getcloudify.org/spec/diamond-plugin/1.3.6/plugin.yaml
+  - http://www.getcloudify.org/spec/utilities-plugin/1.4.2/plugin.yaml
+  - includes/commons.yaml
+
+inputs:
+  #bigip ltm service inputs
+  app_node_1_ip:
+    type: string
+    description: >
+      App server IP, ex. 192.168.20.50
+    default: ''
+
+  app_node_1_port:
+    type: string
+    description: >
+      App server port, ex. 8080
+
+  app_node_2_ip:
+    type: string
+    description: > 
+      App server IP, ex. 192.168.20.51
+    default: ''
+
+  app_node_2_port:
+    type: string
+    description: >
+      App server port, ex. 8080
+
+  destination_port:
+    type: string
+    description: >
+      App port exposed on bigip, ex. 8888
+
+  #nodejs appserver inputs
+  image:
+    description: >
+      Openstack image ID, tested ubuntu 14.04
+    default: { get_secret: ubuntu_trusty_image }
+
+  flavor:
+    description: >
+      Openstack Flavor ID.
+    default: { get_secret: small_image_flavor }
+
+  agent_user:
+    description: agent username, ubuntu instance
+    default: ubuntu
+  
+
+dsl_definitions:
+  openstack_config: &openstack_config
+    username: { get_secret: keystone_username }
+    password: { get_secret: keystone_password }
+    tenant_name: { get_secret: keystone_tenant_name }
+    auth_url: { get_secret: keystone_url }
+    region: { get_secret: region }
+
+
+node_templates:
+  #nodejs appserver node templates
+  nodecellar:
+    type: nodecellar.nodes.NodecellarApplicationModule
+    relationships:
+      - type: node_connected_to_mongo
+        target: mongod
+      - type: node_contained_in_nodejs
+        target: nodejs
+
+  mongod:
+    type: nodecellar.nodes.MongoDatabase
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+
+  nodejs:
+    type: nodecellar.nodes.NodeJSServer
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+
+  host:
+    type: nodecellar.nodes.NotMonitoredServer
+    instances:
+      deploy: 1
+    properties:
+      openstack_config: *openstack_config
+      management_network_name: { get_property: [ private_network, resource_id ] }
+    relationships:
+      - target: host_port
+        type: cloudify.openstack.server_connected_to_port
+  
+  host_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: private_network
+      - type: cloudify.relationships.depends_on
+        target: private_subnet
+      - type: cloudify.openstack.port_connected_to_security_group
+        target: nodecellar_security_group
+      - type: cloudify.openstack.port_connected_to_floating_ip
+        target: nodecellar_ip
+
+  nodecellar_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_config
+      security_group:
+        description: Nodecellar security group
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          port: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          port: { get_property: [ nodecellar, port ] }
+
+  nodecellar_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      openstack_config: *openstack_config
+      floatingip:
+        floating_network_name: { get_property: [ external_network, resource_id ] }
+
+  private_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_secret: private_subnet_name }
+    relationships:
+      - target: private_network
+        type: cloudify.relationships.contained_in
+
+  private_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_secret: private_network_name }
+
+  router:
+    type: cloudify.openstack.nodes.Router
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_secret: router_name }
+    relationships:
+      - target: external_network
+        type: cloudify.relationships.connected_to
+
+  external_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_secret: external_network_name }
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: cloudify_host_cloud_config
+
+
+  #bigip ve node templates
+  baseline_config:
+    type: cloudify.terminal.raw
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            terminal_auth: &terminal_auth
+              user: root
+              password: default
+              ip: { get_attribute: [bigip_vnf, ip] }
+              promt_check:
+                - '#'
+                - '$'
+              errors:
+                - "Command fail."
+            calls:
+              - action: exit
+        start:
+          inputs:
+            terminal_auth: *terminal_auth
+            calls:
+              - template: scripts/bigip/bigip-baseline.txt
+                params:
+                  IP_INSIDE: {get_attribute: [bigip_vnf, networks, sg-inside, 0]}
+                  IP_OUTSIDE: {get_attribute: [bigip_vnf, networks, sg-outside, 0]}
+                 
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: bigip_vnf
+      - type: cloudify.relationships.depends_on
+        target: mgmt_port
+
+  bigip_vnf:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *openstack_config
+      agent_config:
+        install_method: none
+      image: "BIGIP-13.0.0.2.0.1671"
+      flavor: m1.xlarge
+      management_network_name: { get_property: [ mgmt_network, resource_id ] }
+    relationships:
+    - type: cloudify.openstack.server_connected_to_port
+      target: mgmt_port
+    - type: cloudify.openstack.server_connected_to_port
+      target: inside_port
+    - type: cloudify.openstack.server_connected_to_port
+      target: outside_port
+
+  outside_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: outside_network
+    - type: cloudify.relationships.depends_on
+      target: outside_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+    - type: cloudify.openstack.port_connected_to_floating_ip
+      target: floating_ip_app
+
+  inside_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: inside_network
+    - type: cloudify.relationships.depends_on
+      target: inside_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+
+  mgmt_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: mgmt_network
+    - type: cloudify.relationships.depends_on
+      target: mgmt_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+    - type: cloudify.openstack.port_connected_to_floating_ip
+      target: floating_ip_mgmt
+
+  outside_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: CLOUDIFY_OUTSIDE_SUBNET
+    relationships:
+    - target: outside_network
+      type: cloudify.relationships.contained_in
+
+  inside_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: sg-inside-subnet
+    relationships:
+    - target: inside_network
+      type: cloudify.relationships.contained_in
+
+  mgmt_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: mgmt-subnet
+    relationships:
+    - target: mgmt_network
+      type: cloudify.relationships.contained_in
+
+  outside_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: CLOUDIFY_OUTSIDE_NET
+
+  inside_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: CLOUDIFY_INSIDE_NET
+
+  mgmt_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: CLOUDIFY_MGMT_NET
+
+  security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_config
+      security_group:
+        description: generic security group
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "TCP"
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "UDP"
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "ICMP"
+          port_range_min: 0
+          port_range_max: 0
+
+  floating_ip_mgmt:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      openstack_config: *openstack_config
+      floatingip:
+        floating_network_name: { get_secret: external_network_name }
+
+  floating_ip_app:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      openstack_config: *openstack_config
+      floatingip:
+        floating_network_name: { get_secret: external_network_name }            
+  
+
+  #bigip ltm service node templates
+  bigip_baseline_vnf_deployment:
+    type: cloudify.nodes.DeploymentProxy
+    properties:
+      resource_config:
+        blueprint:
+          id: bigip-baseline-blueprint
+          external_resource: true
+        deployment:
+          id: bigip-baseline
+          external_resource: true
+          outputs:
+            bigip_mgmt_ip: mgmt_ip
+            bigip_outside_ip: outside_ip
+            bigip_inside_ip: inside_ip
+
+  bigip_ltm_service:
+    type: cloudify.terminal.raw
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        # create:
+        #   inputs:
+        #     terminal_auth: &terminal_auth
+        #       user: root
+        #       password: default
+        #       ip: { get_attribute: [bigip_baseline_vnf_deployment, deployment, outputs, mgmt_ip ] }
+        #       promt_check:
+        #         - '#'
+        #         - '$'
+        #       errors:
+        #         - "Command fail."
+        #     calls:
+        #       - action: exit
+        start: 
+          inputs:
+            terminal_auth: *terminal_auth
+            calls:
+              - template: scripts/bigip/bigip-ltm-service-start.txt
+                params:
+                  APP_NODE_1_IP: { get_input: app_node_1_ip }
+                  APP_NODE_1_PORT: { get_input: app_node_1_port }
+                  APP_NODE_2_IP: { get_input: app_node_2_ip }
+                  APP_NODE_2_PORT: { get_input: app_node_2_port }
+                  DESTINATION_IP: { get_attribute: [bigip_baseline_vnf_deployment, deployment, outputs, outside_ip ] }      
+                  DESTINATION_PORT: { get_input: destination_port }
+        stop:
+          inputs:
+            terminal_auth: *terminal_auth
+            calls:
+              - template: scripts/bigip/bigip-ltm-service-stop.txt
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: bigip_baseline_vnf_deployment
+
+
+outputs:
+  #bigip ve outputs
+  bigip_mgmt_ip:
+    value: { get_attribute: [bigip_vnf, ip] }
+  bigip_outside_ip:
+    value: {get_attribute: [bigip_vnf, networks, sg-outside, 0]}
+  bigip_inside_ip:
+    value: {get_attribute: [bigip_vnf, networks, sg-outside, 0]}
+
+  #nodejs appserver outputs
+  endpoint:
+    description: Web application endpoint
+    value:
+      concat:
+      - 'http://'
+      - { get_attribute: [ nodecellar_ip, floating_ip_address ] }
+      - ':'
+      - '/'
+
+# onboard_yaml:
+  #   type: string
+  #   default: |
+  #     #cloud-config
+  #     write_files:
+
+  #     - path: /config/cloud/onboard.sh
+  #       permissions: 0755
+  #       owner: root:root
+  #       content: |
+  #         #!/bin/bash
+
+  #         # Load Input Parameters
+  #         . /config/cloud/onboard_config_vars
+
+  #         # Download Onboarding Libs.
+  #         # Could be pre-packaged or hosted internally
+  #         curl -o /config/cloud/f5-cloud-libs.tar.gz --silent --fail --retry 20 -L https://api.github.com/repos/F5Networks/f5-cloud-libs/tarball/develop
+  #         tar xvzf /config/cloud/f5-cloud-libs.tar.gz -C /config/cloud/
+  #         mv /config/cloud/F5Networks-f5-cloud-libs-* /config/cloud/f5-cloud-libs
+  #         cd /config/cloud/f5-cloud-libs
+  #         npm install --production
+
+  #         # License / Provision
+  #         f5-rest-node /config/cloud/f5-cloud-libs/scripts/onboard.js \
+  #             -o  /var/log/onboard.log \
+  #             --no-reboot  \
+  #             --log-level verbose \
+  #             --host localhost \
+  #             --user admin \
+  #             --password admin \
+  #             --port 443 \
+  #             --hostname ${HOSTNAME} \
+  #             --global-setting hostname:${HOSTNAME} \
+  #             --set-root-password old:default,new:${BIGIP_ROOT_PASSWORD} \
+  #             --ping www.f5.com 30 15 \
+
+  #     - path: /config/cloud/onboard_config_vars
+  #       permissions: 0755
+  #       owner: root:root
+  #       content: |
+  #         #!/bin/bash
+
+  #         HOSTNAME=sg-bigip.com
+  #         BIGIP_ADMIN_USERNAME=admin
+  #         BIGIP_ADMIN_PASSWORD=demo
+  #         BIGIP_ROOT_PASSWORD=demo
+  #         BIGIP_LICENSE_KEY=ZBVNS-ZSZRE-ISOTV-TSQIF-RYAOUQH
+
+  #     runcmd:
+  #       - /config/cloud/onboard.sh &
+
+
+
+
+
+# tosca_definitions_version: cloudify_dsl_1_3
+
+# imports:
+#   - http://www.getcloudify.org/spec/cloudify/4.1.1/types.yaml
+#   - http://www.getcloudify.org/spec/openstack-plugin/2.0.1/plugin.yaml
+#   - http://www.getcloudify.org/spec/diamond-plugin/1.3.6/plugin.yaml
+
+# inputs:
+#   bigip_image:
+#     type: string
+#     default: 'CentOS 7.3 (1611)'
+
+#   bigip_flavor:
+#     type: string
+#     default: dc1.1x1
+
+#   web_image:
+#     description: >
+#       Image to be used when launching agent VM's
+#     type: string
+#     default: 'CentOS 7.3 (1611)'
+
+#   web_flavor:
+#     description: >
+#       Flavor of the agent VM's
+#     type: string
+#     default: dc1.1x1
+
+#   agent_user:
+#     description: >
+#       User for connecting to agent VM's
+#     type: string
+#     default: centos
+
+#   key_name:
+#     default: master
+
+#   private_key_path:
+#     default: /etc/cloudify/isaac_gs.pem
+#     type: string
+
+#   AdminNetwork_network_name:
+#     default: default
+
+#   internal_network_name:
+#     default: f5-default
+
+#   app_security_group:
+#     default: default
+
+#   bigip_security_group:
+#     default: default
+
+#   agents_security_group:
+#     default: cloudify-4.0-agents
+
+#   keystone_username:
+#     default: ''
+#     type: string
+
+#   keystone_password:
+#     default: ''
+#     type: string
+
+#   keystone_tenant_name:
+#     default: ''
+#     type: string
+
+#   keystone_url:
+#     default: ''
+#     type: string
+
+#   region:
+#     default: ''
+#     type: string
+
+# dsl_definitions:
+#   openstack_configuration: &openstack_config
+#     username: { get_input: keystone_username }
+#     password: { get_input: keystone_password }
+#     tenant_name: { get_input: keystone_tenant_name }
+#     auth_url: { get_input: keystone_url }
+#     region: { get_input: region }
+
+#   agent_config: &agent_config
+#     user: { get_input: agent_user }
+#     key: { get_property: [ key, private_key_path ] }
+
+# node_types:
+#   host:
+#     derived_from: cloudify.openstack.nodes.Server
+#     properties:
+#       openstack_config:
+#         default: *openstack_config
+#       management_network_name:
+#         default: { get_input: AdminNetwork_network_name }
+#       collectors:
+#         default: {}
+#     interfaces:
+#       cloudify.interfaces.lifecycle:
+#         create:
+#           # Needed until JIRA issue OPENSTACK-38 is resolved.
+#           implementation: openstack.nova_plugin.server.create
+#           inputs:
+#             args:
+#               default:
+#                 security_groups:
+#                   - { get_input: agents_security_group }
+#       cloudify.interfaces.monitoring_agent:
+#         install:
+#           implementation: diamond.diamond_agent.tasks.install
+#           inputs:
+#             diamond_config:
+#               default:
+#                 interval: 1
+#         start: diamond.diamond_agent.tasks.start
+#         stop: diamond.diamond_agent.tasks.stop
+#         uninstall: diamond.diamond_agent.tasks.uninstall
+#       cloudify.interfaces.monitoring:
+#         start:
+#           implementation: diamond.diamond_agent.tasks.add_collectors
+#           inputs:
+#             collectors_config:
+#               default: { get_property: [SELF, collectors]}
+
+# node_templates:
+
+#   ansible:
+#     type: cloudify.nodes.Root
+#     relationships:
+#       - type: cloudify.relationships.contained_in
+#         target: application_host
+
+#   application:
+#     type: cloudify.nodes.Root
+#     interfaces:
+#       cloudify.interfaces.lifecycle:
+#         create:
+#           implementation: scripts/provision.py
+#           inputs:
+#             networks: { get_attribute: [ application_host, networks ]}
+#     relationships:
+#       - type: cloudify.relationships.contained_in
+#         target: application_host
+
+#   application_host:
+#     type: host
+#     properties:
+#       image: { get_input: web_image }
+#       flavor: { get_input: web_flavor }
+#       agent_config: *agent_config
+#       collectors:
+#         CPUCollector: {}
+#         MemoryCollector: {}
+#         LoadAverageCollector: {}
+#         NetworkCollector: {}
+#     relationships:
+#       - target: key
+#         type: cloudify.openstack.server_connected_to_keypair
+#       - target: agents_security_group
+#         type: cloudify.openstack.server_connected_to_security_group
+#       - target: application_security_group
+#         type: cloudify.openstack.server_connected_to_security_group
+#       - target: AdminNetwork_network
+#         type: cloudify.relationships.connected_to
+#       - target: internal_network
+#         type: cloudify.relationships.connected_to
+
+#   bigip_ansible:
+#     type: cloudify.nodes.Root
+#     relationships:
+#       - type: cloudify.relationships.contained_in
+#         target: bigip_host
+#       - type: cloudify.relationships.depends_on
+#         target: application
+
+#   bigip_host:
+#     type: host
+#     properties:
+#       image: { get_input: bigip_image }
+#       flavor: { get_input: bigip_flavor }
+#       agent_config: *agent_config
+#       collectors:
+#         CPUCollector:
+#           config:
+#             percore: true
+#         MemoryCollector: {}
+#         LoadAverageCollector: {}
+#         NetworkCollector: {}
+#         ProcessResourcesCollector:
+#           config:
+#             unit: B
+#             measure_collector_time: true
+#             cpu_interval: 0.5
+#             process:
+#               tmm:
+#                 name: ^tmm
+#     relationships:
+#       - target: key
+#         type: cloudify.openstack.server_connected_to_keypair
+#       - target: agents_security_group
+#         type: cloudify.openstack.server_connected_to_security_group
+#       - target: bigip_security_group
+#         type: cloudify.openstack.server_connected_to_security_group
+#       - target: AdminNetwork_network
+#         type: cloudify.relationships.connected_to
+#       - target: internal_network
+#         type: cloudify.relationships.connected_to
+
+#   agents_security_group:
+#     type: cloudify.openstack.nodes.SecurityGroup
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: agents_security_group }
+
+#   application_security_group:
+#     type: cloudify.openstack.nodes.SecurityGroup
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: app_security_group }
+
+#   bigip_security_group:
+#     type: cloudify.openstack.nodes.SecurityGroup
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: bigip_security_group }
+
+#   internal_network:
+#     type: cloudify.openstack.nodes.Network
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: internal_network_name }
+
+#   AdminNetwork_network:
+#     type: cloudify.openstack.nodes.Network
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: AdminNetwork_network_name }
+
+#   key:
+#     type: cloudify.openstack.nodes.KeyPair
+#     properties:
+#       openstack_config: *openstack_config
+#       use_external_resource: true
+#       resource_id: { get_input: key_name }
+#       private_key_path: { get_input: private_key_path }
+
+# outputs:
+#   Web endpoint:
+#     description: Web application endpoint
+#     value:
+#       ip_address: { get_attribute: [ application_host, ip ] }
+#   bigip endpoint:
+#     description: BIGIP mgmt ip
+#     value:
+#       ip_address: { get_attribute: [ bigip_host, ip ] }
+
+# groups:
+#   app:
+#     members: [application_host, bigip_host]
+
+#   scale_up_group:
+#     members: [application_host]
+#     policies:
+#       auto_scale_up:
+#         type: scale_policy_type
+#         properties:
+#           policy_operates_on_group: true
+#           scale_limit: 6
+#           scale_direction: '<'
+#           scale_threshold: 6
+#           service_selector: .*.application_host..*..cpu.total.system
+#           cooldown_time: 60
+#         triggers:
+#           execute_scale_workflow:
+#             type: cloudify.policies.triggers.execute_workflow
+#             parameters:
+#               workflow: scale
+#               workflow_parameters:
+#                 delta: 1
+#                 scalable_entity_name: app
+
+#   scale_down_group:
+#     members: [application_host]
+#     policies:
+#       auto_scale_down:
+#         type: scale_policy_type
+#         properties:
+#           scale_limit: 2
+#           scale_direction: '>'
+#           scale_threshold: 1
+#           service_selector: .*.application_host..*..cpu.total.system
+#           cooldown_time: 60
+#         triggers:
+#           execute_scale_workflow:
+#             type: cloudify.policies.triggers.execute_workflow
+#             parameters:
+#               workflow: scale
+#               workflow_parameters:
+#                 delta: -1
+#                 scalable_entity_name: app
+
+# policies:
+#   app_policy:
+#     type: cloudify.policies.scaling
+#     properties:
+#       default_instances: 1
+#     targets: [app]
+
+# policy_types:
+#   scale_policy_type:
+#     source: policies/scale.clj
+#     properties:
+#       policy_operates_on_group:
+#         default: true
+#       service_selector:
+#         description: regular expression that selects the metric to be measured
+#         default: ".*"
+#       moving_window_size:
+#         description: the moving window for individual sources in secs
+#         default: 10
+#       scale_threshold:
+#         description: the value to trigger scaling over aggregrated moving values
+#       scale_limit:
+#         description: scaling limit
+#         default: 10
+#       scale_direction:
+#         description: scale up ('<') or scale down ('>')
+#         default: '<'
+#       cooldown_time:
+#         description: the time to wait before evaluating again after a scale
+#         default: 60

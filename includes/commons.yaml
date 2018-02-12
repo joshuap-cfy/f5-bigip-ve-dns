@@ -1,0 +1,121 @@
+node_types:
+  #cloud_config node types
+  cloudify.nodes.CloudConfig:
+    derived_from: cloudify.nodes.Root
+    properties:
+      resource_config:
+        default:
+          encode_base64: false
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/cloud_config/create.py
+          executor: central_deployment_agent
+
+  #type inherits openstack's default server, adds monitoring
+  nodecellar.nodes.NotMonitoredServer:
+    derived_from: cloudify.openstack.nodes.Server
+    properties:
+      agent_config:
+        default:
+          user: { get_input: agent_user }
+          install_method: remote
+          port: 22
+          key: { get_secret: agent_key_private }
+      server:
+        default:
+          key_name: ''
+          image: { get_input: image }
+          flavor: { get_input: flavor }
+      management_network_name:
+        default: { get_property: [ public_network, resource_id ] }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: openstack.nova_plugin.server.create
+          inputs:
+            args:
+              default:
+                image: { get_input: image }
+                flavor: { get_input: flavor }
+                userdata: { get_attribute: [ cloudify_host_cloud_config, cloud_config ] }
+  
+  #mongodb node types and relationships
+  nodecellar.nodes.MongoDatabase:
+    derived_from: cloudify.nodes.DBMS
+    properties:
+      port:
+        description: MongoDB port
+        type: integer
+        default: 27017
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: scripts/mongo/install-mongo.sh
+        start: scripts/mongo/start-mongo.sh
+        stop: scripts/mongo/stop-mongo.sh
+        stop: scripts/mongo/stop-mongo.sh
+  
+  #nodecellar node types
+  nodecellar.nodes.NodeJSServer:
+    derived_from: cloudify.nodes.ApplicationServer
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: scripts/nodejs/install-nodejs.sh
+
+  nodecellar.nodes.NodecellarApplicationModule:
+    derived_from: cloudify.nodes.ApplicationModule
+    properties:
+      port:
+        description: Web application port
+        type: integer
+        default: 8080
+      application_url:
+        description: >
+          URL to an archive containing the application source.
+          The archive must contain one top level directory.
+        default: https://github.com/cloudify-cosmo/nodecellar/archive/master.tar.gz
+      startup_script:
+        description: >
+          This script will be used to start the nodejs application.
+          The path is relative to the top level single directory inside
+          the archive
+        type: string
+        default: server.js
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: scripts/nodecellar/install-nodecellar-app.sh
+        start: scripts/nodecellar/start-nodecellar-app.sh
+        stop: scripts/nodecellar/stop-nodecellar-app.sh
+
+relationships:
+  #set mongo ip as runtime prop
+  node_connected_to_mongo:
+    derived_from: cloudify.relationships.connected_to
+    target_interfaces:
+      cloudify.interfaces.relationship_lifecycle:
+        postconfigure:
+          implementation: scripts/mongo/set-mongo-url.sh
+          inputs:
+            mongo_ip_address:
+              description: >
+                The ip mongo is deployed on.  If empty will be resolved at runtime to mongo\'s host ip.
+              default: ''
+              
+  #relationship sets nodejs-root, for npm pkg resolutions
+  node_contained_in_nodejs:
+    derived_from: cloudify.relationships.contained_in
+    target_interfaces:
+      cloudify.interfaces.relationship_lifecycle:
+        preconfigure: scripts/nodejs/set-nodejs-root.sh
+
+node_templates:
+  cloudify_host_cloud_config:
+    type: cloudify.nodes.CloudInit.CloudConfig
+    properties:
+      resource_config:
+        users:
+          - name: { get_input: agent_user }
+            shell: /bin/bash
+            sudo: ['ALL=(ALL) NOPASSWD:ALL']
+            ssh-authorized-keys:
+              - { get_secret: agent_key_public }
